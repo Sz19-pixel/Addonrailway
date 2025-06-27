@@ -530,16 +530,16 @@ def health_check():
     })
 
 @app.errorhandler(404)
-def not_found(error): 
-return jsonify({"error": "Not found"}), 404
-
-@app.route('/open')
-def open_landing():
-    return send_file("landing.html")
+def not_found(error):
+    return jsonify({"error": "Not found"}), 404
 
 @app.errorhandler(500)
 def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/open')
+def open_landing():
+    return send_file("landing.html")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
