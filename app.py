@@ -15,7 +15,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import cloudscraper
-import cfscrape
 from fake_useragent import UserAgent
 import threading
 from urllib.parse import urljoin, urlparse
@@ -31,7 +30,7 @@ CORS(app)
 # Addon manifest
 MANIFEST = {
     "id": "com.wecima.stremio",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "name": "Wecima Pro Addon",
     "description": "Advanced streaming from Wecima.video with powerful scraping",
     "resources": ["catalog", "meta", "stream"],
@@ -59,14 +58,33 @@ class AdvancedWecimaScraper:
         self.ua = UserAgent()
         
         # Initialize CloudScraper (bypasses Cloudflare)
-        self.scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'desktop': True
-            }
-        )
-        self.scraper.headers.update({
+        try:
+            self.scraper = cloudscraper.create_scraper(
+                browser={
+                    'browser': 'chrome',
+                    'platform': 'windows',
+                    'desktop': True
+                }
+            )
+            self.scraper.headers.update({
+                'User-Agent': self.ua.random,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Cache-Control': 'max-age=0',
+            })
+        except Exception as e:
+            logger.warning(f"CloudScraper initialization failed: {e}")
+            self.scraper = None
+        
+        # Backup session
+        self.session = requests.Session()
+        self.session.headers.update({
             'User-Agent': self.ua.random,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
@@ -78,10 +96,6 @@ class AdvancedWecimaScraper:
             'Sec-Fetch-Site': 'none',
             'Cache-Control': 'max-age=0',
         })
-        
-        # Backup session
-        self.session = requests.Session()
-        self.session.headers.update(self.scraper.headers)
         
         # Chrome driver options (for Railway deployment)
         self.chrome_options = Options()
@@ -121,13 +135,14 @@ class AdvancedWecimaScraper:
                         if driver:
                             driver.quit()
             
-            # Try CloudScraper first
-            try:
-                response = self.scraper.get(url, timeout=15)
-                response.raise_for_status()
-                return response.text
-            except Exception as e:
-                logger.warning(f"CloudScraper failed: {e}")
+            # Try CloudScraper first if available
+            if self.scraper:
+                try:
+                    response = self.scraper.get(url, timeout=15)
+                    response.raise_for_status()
+                    return response.text
+                except Exception as e:
+                    logger.warning(f"CloudScraper failed: {e}")
             
             # Fallback to regular session
             response = self.session.get(url, timeout=10)
@@ -147,7 +162,11 @@ class AdvancedWecimaScraper:
             
             # Try POST search
             try:
-                response = self.scraper.post(search_url, data=search_data, timeout=10)
+                if self.scraper:
+                    response = self.scraper.post(search_url, data=search_data, timeout=10)
+                else:
+                    response = self.session.post(search_url, data=search_data, timeout=10)
+                    
                 if response.status_code == 200:
                     html_content = response.text
                 else:
@@ -684,7 +703,7 @@ def health():
 def index():
     return jsonify({
         "name": "Wecima Pro Stremio Addon",
-        "version": "2.0.0",
+        "version": "2.0.1",
         "description": "Advanced streaming from Wecima.video with powerful scraping",
         "manifest": "/manifest.json",
         "endpoints": {
