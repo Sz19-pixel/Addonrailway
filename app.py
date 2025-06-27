@@ -8,6 +8,18 @@ from flask_cors import CORS
 import logging
 from datetime import datetime, timedelta
 import time
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import cloudscraper
+import cfscrape
+from fake_useragent import UserAgent
+import threading
+from urllib.parse import urljoin, urlparse
+import base64
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,232 +31,537 @@ CORS(app)
 # Addon manifest
 MANIFEST = {
     "id": "com.wecima.stremio",
-    "version": "1.0.0",
-    "name": "Wecima Addon",
-    "description": "Stream movies and TV shows from Wecima.video",
+    "version": "2.0.0",
+    "name": "Wecima Pro Addon",
+    "description": "Advanced streaming from Wecima.video with powerful scraping",
     "resources": ["catalog", "meta", "stream"],
     "types": ["movie", "series"],
     "catalogs": [
         {
             "type": "movie",
             "id": "wecima-movies",
-            "name": "Wecima Movies"
+            "name": "Wecima Movies",
+            "extra": [{"name": "search", "isRequired": False}]
         },
         {
             "type": "series",
             "id": "wecima-series", 
-            "name": "Wecima Series"
+            "name": "Wecima Series",
+            "extra": [{"name": "search", "isRequired": False}]
         }
     ],
     "idPrefixes": ["wecima:"]
 }
 
-class WecimaScraper:
+class AdvancedWecimaScraper:
     def __init__(self):
         self.base_url = "https://wecima.video"
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
+        self.ua = UserAgent()
+        
+        # Initialize CloudScraper (bypasses Cloudflare)
+        self.scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True
+            }
+        )
+        self.scraper.headers.update({
+            'User-Agent': self.ua.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
         })
+        
+        # Backup session
+        self.session = requests.Session()
+        self.session.headers.update(self.scraper.headers)
+        
+        # Chrome driver options (for Railway deployment)
+        self.chrome_options = Options()
+        self.chrome_options.add_argument('--headless')
+        self.chrome_options.add_argument('--no-sandbox')
+        self.chrome_options.add_argument('--disable-dev-shm-usage')
+        self.chrome_options.add_argument('--disable-gpu')
+        self.chrome_options.add_argument('--window-size=1920,1080')
+        self.chrome_options.add_argument(f'--user-agent={self.ua.random}')
+        
+    def get_selenium_driver(self):
+        """Get Selenium WebDriver for JavaScript-heavy pages"""
+        try:
+            driver = webdriver.Chrome(options=self.chrome_options)
+            return driver
+        except Exception as e:
+            logger.error(f"Failed to create Chrome driver: {e}")
+            return None
+    
+    def make_request(self, url, use_selenium=False, wait_for_element=None):
+        """Make request with multiple fallback methods"""
+        try:
+            if use_selenium:
+                driver = self.get_selenium_driver()
+                if driver:
+                    try:
+                        driver.get(url)
+                        if wait_for_element:
+                            WebDriverWait(driver, 10).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, wait_for_element))
+                            )
+                        content = driver.page_source
+                        driver.quit()
+                        return content
+                    except Exception as e:
+                        logger.error(f"Selenium error: {e}")
+                        if driver:
+                            driver.quit()
+            
+            # Try CloudScraper first
+            try:
+                response = self.scraper.get(url, timeout=15)
+                response.raise_for_status()
+                return response.text
+            except Exception as e:
+                logger.warning(f"CloudScraper failed: {e}")
+            
+            # Fallback to regular session
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            return response.text
+            
+        except Exception as e:
+            logger.error(f"All request methods failed for {url}: {e}")
+            return None
     
     def search_content(self, query, content_type="movie"):
-        """Search for content on Wecima"""
+        """Advanced search with multiple methods"""
         try:
-            search_url = f"{self.base_url}/search/{urllib.parse.quote(query)}"
-            response = self.session.get(search_url, timeout=10)
-            response.raise_for_status()
+            # Method 1: Direct search
+            search_url = f"{self.base_url}/search"
+            search_data = {'s': query}
             
-            soup = BeautifulSoup(response.text, 'html.parser')
+            # Try POST search
+            try:
+                response = self.scraper.post(search_url, data=search_data, timeout=10)
+                if response.status_code == 200:
+                    html_content = response.text
+                else:
+                    # Fallback to GET search
+                    search_url = f"{self.base_url}/?s={urllib.parse.quote(query)}"
+                    html_content = self.make_request(search_url)
+            except:
+                search_url = f"{self.base_url}/?s={urllib.parse.quote(query)}"
+                html_content = self.make_request(search_url)
+            
+            if not html_content:
+                return []
+            
+            soup = BeautifulSoup(html_content, 'html.parser')
             results = []
             
-            # Find movie/series containers
-            content_items = soup.find_all('div', class_='item')
+            # Multiple selectors for different page layouts
+            selectors = [
+                'article.post',
+                'div.movie-item',
+                'div.item',
+                '.content-box',
+                '.movie',
+                '.film-item'
+            ]
             
-            for item in content_items[:10]:  # Limit to 10 results
+            content_items = []
+            for selector in selectors:
+                items = soup.select(selector)
+                if items:
+                    content_items = items
+                    break
+            
+            for item in content_items[:15]:
                 try:
-                    title_elem = item.find('h3') or item.find('a')
-                    link_elem = item.find('a')
-                    img_elem = item.find('img')
+                    # Find title with multiple selectors
+                    title_selectors = ['h3 a', 'h2 a', '.title a', 'a.title', 'h4 a', '.movie-title a']
+                    title_elem = None
+                    link = None
                     
-                    if title_elem and link_elem:
-                        title = title_elem.get_text(strip=True)
-                        link = link_elem.get('href')
-                        if not link.startswith('http'):
-                            link = self.base_url + link
-                        
-                        poster = ""
+                    for sel in title_selectors:
+                        title_elem = item.select_one(sel)
+                        if title_elem:
+                            link = title_elem.get('href')
+                            break
+                    
+                    if not title_elem:
+                        # Try any link in the item
+                        link_elem = item.find('a')
+                        if link_elem:
+                            title_elem = link_elem
+                            link = link_elem.get('href')
+                    
+                    if not title_elem or not link:
+                        continue
+                    
+                    title = title_elem.get_text(strip=True)
+                    if not link.startswith('http'):
+                        link = urljoin(self.base_url, link)
+                    
+                    # Find poster with multiple selectors
+                    poster_selectors = ['img.poster', '.poster img', 'img', '.movie-poster img']
+                    poster = ""
+                    for sel in poster_selectors:
+                        img_elem = item.select_one(sel)
                         if img_elem:
-                            poster = img_elem.get('src') or img_elem.get('data-src')
-                            if poster and not poster.startswith('http'):
-                                poster = self.base_url + poster
-                        
-                        # Extract year from title if possible
-                        year_match = re.search(r'\((\d{4})\)', title)
-                        year = year_match.group(1) if year_match else ""
-                        
-                        results.append({
-                            'id': f"wecima:{urllib.parse.quote(link)}",
-                            'title': title,
-                            'year': year,
-                            'poster': poster,
-                            'link': link
-                        })
+                            poster = img_elem.get('src') or img_elem.get('data-src') or img_elem.get('data-lazy-src')
+                            if poster:
+                                if not poster.startswith('http'):
+                                    poster = urljoin(self.base_url, poster)
+                                break
+                    
+                    # Extract year
+                    year_match = re.search(r'(\d{4})', title)
+                    year = year_match.group(1) if year_match else ""
+                    
+                    # Determine content type
+                    detected_type = "movie"
+                    if any(keyword in title.lower() for keyword in ['مسلسل', 'series', 'season', 'episode']):
+                        detected_type = "series"
+                    
+                    results.append({
+                        'id': f"wecima:{base64.b64encode(link.encode()).decode()}",
+                        'title': title,
+                        'year': year,
+                        'poster': poster,
+                        'link': link,
+                        'type': detected_type
+                    })
+                    
                 except Exception as e:
                     logger.error(f"Error parsing search result: {e}")
                     continue
             
             return results
+            
         except Exception as e:
             logger.error(f"Search error: {e}")
             return []
     
-    def get_movie_details(self, movie_link):
-        """Get movie details from Wecima"""
+    def get_content_details(self, content_link):
+        """Get detailed content information"""
         try:
-            response = self.session.get(movie_link, timeout=10)
-            response.raise_for_status()
+            html_content = self.make_request(content_link, use_selenium=True, wait_for_element='.movie-details, .content')
+            if not html_content:
+                return None
             
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Extract movie details
-            title_elem = soup.find('h1') or soup.find('h2', class_='title')
-            title = title_elem.get_text(strip=True) if title_elem else "Unknown"
+            # Extract title with multiple selectors
+            title_selectors = ['h1.entry-title', 'h1', 'h2.title', '.movie-title h1', '.content-title']
+            title = "Unknown"
+            for sel in title_selectors:
+                title_elem = soup.select_one(sel)
+                if title_elem:
+                    title = title_elem.get_text(strip=True)
+                    break
             
             # Extract description
-            desc_elem = soup.find('div', class_='story') or soup.find('div', class_='description')
-            description = desc_elem.get_text(strip=True) if desc_elem else ""
+            desc_selectors = ['.story', '.description', '.movie-description', '.content p', '.synopsis']
+            description = ""
+            for sel in desc_selectors:
+                desc_elem = soup.select_one(sel)
+                if desc_elem:
+                    description = desc_elem.get_text(strip=True)
+                    break
             
             # Extract poster
-            poster_elem = soup.find('img', class_='poster') or soup.find('div', class_='poster').find('img') if soup.find('div', class_='poster') else None
+            poster_selectors = ['.poster img', '.movie-poster img', '.content img', 'img.wp-post-image']
             poster = ""
-            if poster_elem:
-                poster = poster_elem.get('src') or poster_elem.get('data-src')
-                if poster and not poster.startswith('http'):
-                    poster = self.base_url + poster
+            for sel in poster_selectors:
+                poster_elem = soup.select_one(sel)
+                if poster_elem:
+                    poster = poster_elem.get('src') or poster_elem.get('data-src')
+                    if poster and not poster.startswith('http'):
+                        poster = urljoin(self.base_url, poster)
+                    break
+            
+            # Extract additional metadata
+            year_match = re.search(r'(\d{4})', title)
+            year = year_match.group(1) if year_match else ""
             
             return {
                 'title': title,
                 'description': description,
-                'poster': poster
+                'poster': poster,
+                'year': year
             }
+            
         except Exception as e:
-            logger.error(f"Error getting movie details: {e}")
+            logger.error(f"Error getting content details: {e}")
             return None
     
     def extract_streaming_links(self, content_link):
-        """Extract streaming links from content page"""
+        """Advanced streaming link extraction with multiple methods"""
         try:
-            response = self.session.get(content_link, timeout=10)
-            response.raise_for_status()
+            # First, get the main page with Selenium for JavaScript content
+            html_content = self.make_request(content_link, use_selenium=True, wait_for_element='video, iframe, .player')
+            if not html_content:
+                return []
             
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(html_content, 'html.parser')
             streaming_links = []
             
-            # Look for various streaming link patterns
-            # Method 1: Direct video links
-            video_links = soup.find_all('source') + soup.find_all('video')
-            for video in video_links:
+            # Method 1: Direct video sources
+            video_sources = soup.select('video source, video')
+            for video in video_sources:
                 src = video.get('src')
-                if src and any(ext in src.lower() for ext in ['.mp4', '.m3u8', '.mkv']):
+                if src and self.is_valid_stream_url(src):
                     if not src.startswith('http'):
-                        src = self.base_url + src
+                        src = urljoin(self.base_url, src)
+                    
+                    quality = self.extract_quality(src) or '720p'
                     streaming_links.append({
                         'url': src,
-                        'quality': '720p',
-                        'title': 'Direct Stream'
+                        'quality': quality,
+                        'title': f'Direct Stream ({quality})'
                     })
             
-            # Method 2: Embedded iframe sources
-            iframes = soup.find_all('iframe')
+            # Method 2: Process iframes with Selenium
+            iframes = soup.select('iframe')
             for iframe in iframes:
                 src = iframe.get('src')
                 if src:
                     if not src.startswith('http'):
-                        src = self.base_url + src
+                        src = urljoin(self.base_url, src)
                     
-                    # Try to extract from iframe
-                    try:
-                        iframe_response = self.session.get(src, timeout=5)
-                        iframe_soup = BeautifulSoup(iframe_response.text, 'html.parser')
-                        
-                        # Look for video sources in iframe
-                        iframe_videos = iframe_soup.find_all('source') + iframe_soup.find_all('video')
-                        for video in iframe_videos:
-                            video_src = video.get('src')
-                            if video_src and any(ext in video_src.lower() for ext in ['.mp4', '.m3u8', '.mkv']):
-                                if not video_src.startswith('http'):
-                                    video_src = self.base_url + video_src
-                                streaming_links.append({
-                                    'url': video_src,
-                                    'quality': '720p',
-                                    'title': 'Embedded Stream'
-                                })
-                    except:
-                        pass
+                    # Process iframe with Selenium
+                    iframe_links = self.process_iframe(src)
+                    streaming_links.extend(iframe_links)
             
-            # Method 3: JavaScript embedded links
+            # Method 3: Extract from JavaScript
             scripts = soup.find_all('script')
             for script in scripts:
                 if script.string:
-                    # Look for video URLs in JavaScript
-                    video_urls = re.findall(r'["\']https?://[^"\']*\.(?:mp4|m3u8|mkv)[^"\']*["\']', script.string)
-                    for url in video_urls:
-                        clean_url = url.strip('"\'')
-                        streaming_links.append({
-                            'url': clean_url,
-                            'quality': '720p',
-                            'title': 'JS Stream'
-                        })
+                    js_links = self.extract_from_javascript(script.string)
+                    streaming_links.extend(js_links)
             
-            # Method 4: Look for download/watch buttons
-            watch_buttons = soup.find_all('a', string=re.compile(r'(watch|مشاهدة|تحميل)', re.I))
-            for button in watch_buttons:
-                href = button.get('href')
-                if href:
-                    if not href.startswith('http'):
-                        href = self.base_url + href
-                    
-                    # Try to get the actual video URL
-                    try:
-                        button_response = self.session.get(href, timeout=5)
-                        button_soup = BeautifulSoup(button_response.text, 'html.parser')
+            # Method 4: Look for download/watch buttons and process them
+            button_selectors = [
+                'a[href*="watch"]', 'a[href*="play"]', 'a[href*="stream"]',
+                '.watch-btn', '.play-btn', '.download-btn',
+                'a:contains("مشاهدة")', 'a:contains("تحميل")'
+            ]
+            
+            for selector in button_selectors:
+                buttons = soup.select(selector)
+                for button in buttons:
+                    href = button.get('href')
+                    if href:
+                        if not href.startswith('http'):
+                            href = urljoin(self.base_url, href)
                         
-                        # Look for video sources
-                        button_videos = button_soup.find_all('source') + button_soup.find_all('video')
-                        for video in button_videos:
-                            video_src = video.get('src')
-                            if video_src and any(ext in video_src.lower() for ext in ['.mp4', '.m3u8', '.mkv']):
-                                if not video_src.startswith('http'):
-                                    video_src = self.base_url + video_src
-                                streaming_links.append({
-                                    'url': video_src,
-                                    'quality': '720p',
-                                    'title': 'Watch Button'
-                                })
-                    except:
-                        pass
+                        button_links = self.process_watch_button(href)
+                        streaming_links.extend(button_links)
             
-            # Remove duplicates
+            # Method 5: Check for embed players
+            embed_patterns = [
+                r'(?:embed|player)\.php\?[^"\']*',
+                r'vidsrc\.me/embed/[^"\']*',
+                r'player\.php\?[^"\']*'
+            ]
+            
+            page_text = str(soup)
+            for pattern in embed_patterns:
+                matches = re.findall(pattern, page_text)
+                for match in matches:
+                    if not match.startswith('http'):
+                        match = urljoin(self.base_url, match)
+                    
+                    embed_links = self.process_embed_player(match)
+                    streaming_links.extend(embed_links)
+            
+            # Remove duplicates and invalid links
             unique_links = []
             seen_urls = set()
+            
             for link in streaming_links:
-                if link['url'] not in seen_urls:
+                if link['url'] not in seen_urls and self.is_valid_stream_url(link['url']):
                     seen_urls.add(link['url'])
                     unique_links.append(link)
+            
+            # Sort by quality preference
+            quality_order = {'1080p': 1, '720p': 2, '480p': 3, '360p': 4}
+            unique_links.sort(key=lambda x: quality_order.get(x['quality'], 5))
             
             return unique_links
             
         except Exception as e:
             logger.error(f"Error extracting streaming links: {e}")
             return []
+    
+    def process_iframe(self, iframe_url):
+        """Process iframe content with Selenium"""
+        try:
+            iframe_content = self.make_request(iframe_url, use_selenium=True, wait_for_element='video, source')
+            if not iframe_content:
+                return []
+            
+            soup = BeautifulSoup(iframe_content, 'html.parser')
+            links = []
+            
+            # Look for video sources in iframe
+            video_sources = soup.select('video source, video')
+            for video in video_sources:
+                src = video.get('src')
+                if src and self.is_valid_stream_url(src):
+                    if not src.startswith('http'):
+                        src = urljoin(iframe_url, src)
+                    
+                    quality = self.extract_quality(src) or '720p'
+                    links.append({
+                        'url': src,
+                        'quality': quality,
+                        'title': f'Iframe Stream ({quality})'
+                    })
+            
+            return links
+            
+        except Exception as e:
+            logger.error(f"Error processing iframe {iframe_url}: {e}")
+            return []
+    
+    def extract_from_javascript(self, js_content):
+        """Extract streaming URLs from JavaScript"""
+        links = []
+        
+        # Pattern for video URLs in JavaScript
+        patterns = [
+            r'["\']https?://[^"\']*\.(?:mp4|m3u8|mkv|avi|mov)[^"\']*["\']',
+            r'file\s*:\s*["\']([^"\']+)["\']',
+            r'src\s*:\s*["\']([^"\']+)["\']',
+            r'source\s*:\s*["\']([^"\']+)["\']'
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, js_content, re.IGNORECASE)
+            for match in matches:
+                url = match.strip('"\'')
+                if self.is_valid_stream_url(url):
+                    quality = self.extract_quality(url) or '720p'
+                    links.append({
+                        'url': url,
+                        'quality': quality,
+                        'title': f'JS Stream ({quality})'
+                    })
+        
+        return links
+    
+    def process_watch_button(self, button_url):
+        """Process watch/download button URLs"""
+        try:
+            content = self.make_request(button_url, use_selenium=True)
+            if not content:
+                return []
+            
+            soup = BeautifulSoup(content, 'html.parser')
+            links = []
+            
+            # Look for video sources
+            video_sources = soup.select('video source, video')
+            for video in video_sources:
+                src = video.get('src')
+                if src and self.is_valid_stream_url(src):
+                    if not src.startswith('http'):
+                        src = urljoin(button_url, src)
+                    
+                    quality = self.extract_quality(src) or '720p'
+                    links.append({
+                        'url': src,
+                        'quality': quality,
+                        'title': f'Button Stream ({quality})'
+                    })
+            
+            return links
+            
+        except Exception as e:
+            logger.error(f"Error processing watch button {button_url}: {e}")
+            return []
+    
+    def process_embed_player(self, embed_url):
+        """Process embed player URLs"""
+        try:
+            content = self.make_request(embed_url, use_selenium=True, wait_for_element='video')
+            if not content:
+                return []
+            
+            soup = BeautifulSoup(content, 'html.parser')
+            links = []
+            
+            # Look for video sources in embed player
+            video_sources = soup.select('video source, video')
+            for video in video_sources:
+                src = video.get('src')
+                if src and self.is_valid_stream_url(src):
+                    if not src.startswith('http'):
+                        src = urljoin(embed_url, src)
+                    
+                    quality = self.extract_quality(src) or '720p'
+                    links.append({
+                        'url': src,
+                        'quality': quality,
+                        'title': f'Embed Stream ({quality})'
+                    })
+            
+            return links
+            
+        except Exception as e:
+            logger.error(f"Error processing embed player {embed_url}: {e}")
+            return []
+    
+    def is_valid_stream_url(self, url):
+        """Check if URL is a valid streaming URL"""
+        if not url or len(url) < 10:
+            return False
+        
+        valid_extensions = ['.mp4', '.m3u8', '.mkv', '.avi', '.mov', '.webm', '.flv']
+        valid_domains = ['wecima', 'cdn', 'stream', 'video', 'media']
+        
+        # Check for valid extensions
+        if any(ext in url.lower() for ext in valid_extensions):
+            return True
+        
+        # Check for streaming domains
+        if any(domain in url.lower() for domain in valid_domains):
+            return True
+        
+        # Check for common streaming patterns
+        streaming_patterns = [
+            r'stream',
+            r'video',
+            r'play',
+            r'embed'
+        ]
+        
+        return any(re.search(pattern, url, re.IGNORECASE) for pattern in streaming_patterns)
+    
+    def extract_quality(self, url):
+        """Extract quality from URL"""
+        quality_patterns = {
+            '1080': '1080p',
+            '720': '720p', 
+            '480': '480p',
+            '360': '360p'
+        }
+        
+        for pattern, quality in quality_patterns.items():
+            if pattern in url:
+                return quality
+        
+        return None
 
 # Initialize scraper
-scraper = WecimaScraper()
+scraper = AdvancedWecimaScraper()
 
 @app.route('/manifest.json')
 def manifest():
@@ -253,39 +570,31 @@ def manifest():
 @app.route('/catalog/<catalog_type>/<catalog_id>.json')
 def catalog(catalog_type, catalog_id):
     try:
-        # Get popular/trending content
-        if catalog_type == "movie":
-            # Search for popular movies
-            results = scraper.search_content("2024", "movie")
-            
-            catalog_items = []
-            for item in results:
-                catalog_items.append({
-                    "id": item['id'],
-                    "type": "movie",
-                    "name": item['title'],
-                    "poster": item['poster'],
-                    "year": item['year']
-                })
-            
-            return jsonify({"metas": catalog_items})
+        skip = int(request.args.get('skip', 0))
+        search_query = request.args.get('search', '')
         
-        elif catalog_type == "series":
-            # Search for popular series
-            results = scraper.search_content("مسلسل", "series")
-            
-            catalog_items = []
-            for item in results:
-                catalog_items.append({
-                    "id": item['id'],
-                    "type": "series", 
-                    "name": item['title'],
-                    "poster": item['poster'],
-                    "year": item['year']
-                })
-            
-            return jsonify({"metas": catalog_items})
-    
+        if search_query:
+            # Search request
+            results = scraper.search_content(search_query, catalog_type)
+        else:
+            # Default catalog
+            if catalog_type == "movie":
+                results = scraper.search_content("2024 فيلم", "movie")
+            else:
+                results = scraper.search_content("مسلسل 2024", "series")
+        
+        catalog_items = []
+        for item in results[skip:skip+20]:  # Pagination
+            catalog_items.append({
+                "id": item['id'],
+                "type": catalog_type,
+                "name": item['title'],
+                "poster": item['poster'],
+                "year": item['year']
+            })
+        
+        return jsonify({"metas": catalog_items})
+        
     except Exception as e:
         logger.error(f"Catalog error: {e}")
         return jsonify({"metas": []})
@@ -293,12 +602,13 @@ def catalog(catalog_type, catalog_id):
 @app.route('/meta/<content_type>/<content_id>.json')
 def meta(content_type, content_id):
     try:
-        # Decode the content ID to get the original link
         if content_id.startswith('wecima:'):
-            content_link = urllib.parse.unquote(content_id[7:])  # Remove 'wecima:' prefix
+            # Decode base64 encoded URL
+            encoded_url = content_id[7:]  # Remove 'wecima:' prefix
+            content_link = base64.b64decode(encoded_url).decode()
             
-            # Get movie/series details
-            details = scraper.get_movie_details(content_link)
+            # Get content details
+            details = scraper.get_content_details(content_link)
             
             if details:
                 meta_data = {
@@ -306,7 +616,8 @@ def meta(content_type, content_id):
                     "type": content_type,
                     "name": details['title'],
                     "description": details['description'],
-                    "poster": details['poster']
+                    "poster": details['poster'],
+                    "year": details['year']
                 }
                 
                 return jsonify({"meta": meta_data})
@@ -320,22 +631,33 @@ def meta(content_type, content_id):
 @app.route('/stream/<content_type>/<content_id>.json')
 def stream(content_type, content_id):
     try:
-        # Decode the content ID to get the original link
         if content_id.startswith('wecima:'):
-            content_link = urllib.parse.unquote(content_id[7:])  # Remove 'wecima:' prefix
+            # Decode base64 encoded URL
+            encoded_url = content_id[7:]  # Remove 'wecima:' prefix
+            content_link = base64.b64decode(encoded_url).decode()
             
             # Extract streaming links
             streaming_links = scraper.extract_streaming_links(content_link)
             
             streams = []
             for link in streaming_links:
+                # Add subtitle support
                 stream_data = {
                     "url": link['url'],
                     "quality": link['quality'],
-                    "title": f"Wecima - {link['title']} ({link['quality']})"
+                    "title": f"🎬 Wecima - {link['title']}",
+                    "tag": [link['quality']],
                 }
+                
+                # Add headers for some streams
+                if 'wecima' in link['url'].lower():
+                    stream_data["behaviorHints"] = {
+                        "notWebReady": True
+                    }
+                
                 streams.append(stream_data)
             
+            logger.info(f"Found {len(streams)} streams for {content_id}")
             return jsonify({"streams": streams})
         
         return jsonify({"streams": []})
@@ -345,7 +667,7 @@ def stream(content_type, content_id):
         return jsonify({"streams": []})
 
 @app.route('/search/<query>')
-def search(query):
+def search_endpoint(query):
     """Search endpoint for testing"""
     try:
         results = scraper.search_content(query)
@@ -354,17 +676,28 @@ def search(query):
         logger.error(f"Search endpoint error: {e}")
         return jsonify({"results": []})
 
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
 @app.route('/')
 def index():
     return jsonify({
-        "name": "Wecima Stremio Addon",
-        "version": "1.0.0",
-        "description": "Stream content from Wecima.video",
-        "manifest": "/manifest.json"
+        "name": "Wecima Pro Stremio Addon",
+        "version": "2.0.0",
+        "description": "Advanced streaming from Wecima.video with powerful scraping",
+        "manifest": "/manifest.json",
+        "endpoints": {
+            "manifest": "/manifest.json",
+            "catalog": "/catalog/{type}/{id}.json",
+            "meta": "/meta/{type}/{id}.json", 
+            "stream": "/stream/{type}/{id}.json",
+            "search": "/search/{query}",
+            "health": "/health"
+        }
     })
 
 if __name__ == '__main__':
-    # For Railway deployment
     import os
     port = int(os.environ.get('PORT', 7000))
     app.run(host='0.0.0.0', port=port, debug=False)
