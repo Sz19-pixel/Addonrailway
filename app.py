@@ -474,6 +474,10 @@ class EnhancedVidFastScraper:
 # Initialize enhanced scraper
 scraper = EnhancedVidFastScraper()
 
+@app.route('/')pp.route('/')
+def home():
+    return send_file("landing.html")
+
 @app.route('/')
 def home():
     """Home route with addon info"""
@@ -536,10 +540,6 @@ def not_found(error):
 @app.errorhandler(500)
 def internal_error(error):
     return jsonify({"error": "Internal server error"}), 500
-
-@app.route('/open')
-def open_landing():
-    return send_file("landing.html")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
