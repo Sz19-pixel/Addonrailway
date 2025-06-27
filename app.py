@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
@@ -530,8 +530,12 @@ def health_check():
     })
 
 @app.errorhandler(404)
-def not_found(error):
-    return jsonify({"error": "Not found"}), 404
+def not_found(error): 
+return jsonify({"error": "Not found"}), 404
+
+@app.route('/open')
+def open_landing():
+    return send_file("landing.html")
 
 @app.errorhandler(500)
 def internal_error(error):
